@@ -1,6 +1,9 @@
 const canvas = document.getElementById("gameCanvas");
 const ctx = canvas.getContext("2d");
 const usernameInput = document.getElementById("usernameInput");
+let viewportWidth = 1;
+let viewportHeight = 1;
+let renderScale = 1;
 
 const meteorImage = new Image();
 let meteorReady = false;
@@ -21,7 +24,7 @@ let alienReady = false;
 alienImage.onload = () => {
 	alienReady = true;
 };
-alienImage.src = "asset/alien.png";
+alienImage.src = "asset/ufo.png";
 
 const lipsImage = new Image();
 let lipsReady = false;
@@ -60,8 +63,12 @@ let score = 0;
 let isGameOver = false;
 let shakeTime = 0;
 let shakeIntensity = 0;
+let shakePhase = 0;
+let shakeOffsetX = 0;
+let shakeOffsetY = 0;
 let gameOverStart = 0;
-const stageTargets = [10, 25, 45, 70, 100];
+const baseStageTarget = 15;
+const stageTargetStep = 15;
 let currentStage = 0;
 let isStageComplete = false;
 let stageCompleteStart = 0;
@@ -73,6 +80,8 @@ let tempUsername = "";
 let highScores = [];
 let isTypingName = false;
 let showConfirmHome = false;
+let landingWarning = "";
+let scoreboardSource = "landing";
 
 const trail = [];
 const maxTrailLength = 40;
@@ -114,12 +123,52 @@ let lastCollectTime = Date.now();
 let isPressing = false;
 let targetX = 0;
 let targetY = 0;
+let lastTouchInteraction = 0;
 
 let audioContext = null;
 let ambienceGain = null;
 let audioReady = false;
+let lockedViewportSize = null;
+
+const firebaseConfig = {
+	apiKey: "AIzaSyDRK-W5dPJfCIauC9YlQSqy7yErTSI4PD0",
+	authDomain: "space-travel-15474.firebaseapp.com",
+	projectId: "space-travel-15474",
+	storageBucket: "space-travel-15474.firebasestorage.app",
+	messagingSenderId: "759810820973",
+	appId: "1:759810820973:web:f19ab3fe1a41e61b1fa864",
+};
+
+const DEVICE_ID_STORAGE_KEY = "spaceTravelDeviceId";
+const LEADERBOARD_REFRESH_MS = 15000;
+const PLAYER_COLLECTION = "players";
+
+let firebaseReady = false;
+let firebaseDb = null;
+let deviceId = "";
+let leaderboardLoading = false;
+let leaderboardLastFetch = 0;
+let bestScoreCache = 0;
+let bestLevelCache = 1;
+let profileSyncChain = Promise.resolve();
+let profileSyncTimer = null;
+let latestProfileSyncPayload = null;
+
+const getNativeInstallId = () => {
+	try {
+		if (typeof window.APP_INSTALL_ID === "string" && window.APP_INSTALL_ID.trim()) {
+			return window.APP_INSTALL_ID.trim();
+		}
+	} catch (error) {
+		// no-op
+	}
+	return "";
+};
 
 const getViewportSize = () => {
+	if (lockedViewportSize) {
+		return lockedViewportSize;
+	}
 	if (window.visualViewport) {
 		return {
 			width: Math.max(1, Math.floor(window.visualViewport.width)),
@@ -132,14 +181,329 @@ const getViewportSize = () => {
 	};
 };
 
+const getStageTarget = (stageIndex) => {
+	const level = Math.max(0, Math.floor(stageIndex));
+	return baseStageTarget + (level * stageTargetStep);
+};
+
+const lockViewportForKeyboard = () => {
+	const width = Math.max(1, Math.floor(viewportWidth || window.innerWidth));
+	const height = Math.max(1, Math.floor(viewportHeight || window.innerHeight));
+	lockedViewportSize = { width, height };
+};
+
+const unlockViewportForKeyboard = () => {
+	lockedViewportSize = null;
+};
+
+const generateDeviceId = () => {
+	if (window.crypto && typeof window.crypto.randomUUID === "function") {
+		return window.crypto.randomUUID();
+	}
+	return `dev-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+};
+
+const getOrCreateDeviceId = () => {
+	const nativeInstallId = getNativeInstallId();
+	if (nativeInstallId) {
+		try {
+			localStorage.setItem(DEVICE_ID_STORAGE_KEY, nativeInstallId);
+		} catch (error) {
+			// no-op
+		}
+		return nativeInstallId;
+	}
+	try {
+		const stored = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
+		if (stored) {
+			return stored;
+		}
+	} catch (error) {
+		// localStorage yoksa geçici id üret.
+	}
+	const created = generateDeviceId();
+	try {
+		localStorage.setItem(DEVICE_ID_STORAGE_KEY, created);
+	} catch (error) {
+		// Yazılamıyorsa geçici kullanım.
+	}
+	return created;
+};
+
+const sanitizeName = (name) => (name || "").trim().slice(0, 15);
+const hasValidTempUsername = () => sanitizeName(tempUsername).length > 0;
+
+const getPlayerDocRef = () => {
+	if (!firebaseReady || !firebaseDb || !deviceId) {
+		return null;
+	}
+	return firebaseDb.collection(PLAYER_COLLECTION).doc(deviceId);
+};
+
+const syncLocalLeaderboardName = (nextName) => {
+	const clean = sanitizeName(nextName);
+	if (!clean || highScores.length === 0) {
+		return;
+	}
+	for (const entry of highScores) {
+		if (entry.id === deviceId) {
+			entry.name = clean;
+			return;
+		}
+	}
+};
+
+const applyUsername = (nextName, { syncRemote = true } = {}) => {
+	const clean = sanitizeName(nextName);
+	tempUsername = clean;
+	username = clean;
+	landingWarning = "";
+	syncLocalLeaderboardName(clean);
+	if (syncRemote && clean) {
+		void syncPlayerProfile({ name: clean, score: bestScoreCache, level: bestLevelCache });
+	}
+};
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+const parseCssPx = (rawValue) => {
+	const parsed = Number.parseFloat(rawValue);
+	return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const getSafeInsets = () => {
+	const style = getComputedStyle(document.documentElement);
+	return {
+		top: parseCssPx(style.getPropertyValue("--safe-top")),
+		right: parseCssPx(style.getPropertyValue("--safe-right")),
+		bottom: parseCssPx(style.getPropertyValue("--safe-bottom")),
+		left: parseCssPx(style.getPropertyValue("--safe-left")),
+	};
+};
+
+const getUiScale = () => clamp(Math.min(viewportWidth, viewportHeight) / 430, 0.78, 1.12);
+
+const getHeaderMetrics = () => {
+	const scale = getUiScale();
+	const safeInsets = getSafeInsets();
+	return {
+		scale,
+		padding: Math.max(10, 16 * scale),
+		topInset: safeInsets.top,
+		height: Math.max(52, 60 * scale) + safeInsets.top,
+	};
+};
+
+const getCenteredPopupRect = ({ maxWidth, baseHeight, minHeight = 160 }) => {
+	const scale = getUiScale();
+	const safeInsets = getSafeInsets();
+	const horizontalMargin = Math.max(14, 20 * scale);
+	const topMargin = safeInsets.top + Math.max(10, 16 * scale);
+	const bottomMargin = safeInsets.bottom + Math.max(12, 18 * scale);
+	const width = Math.min(maxWidth * scale, viewportWidth - horizontalMargin * 2);
+	const maxHeight = Math.max(minHeight, viewportHeight - topMargin - bottomMargin);
+	const height = clamp(baseHeight * scale, minHeight, maxHeight);
+	const x = (viewportWidth - width) / 2;
+	const y = clamp((viewportHeight - height) / 2, topMargin, viewportHeight - bottomMargin - height);
+	return { x, y, width, height, scale };
+};
+
+const getLandingLayout = () => {
+	const popup = getCenteredPopupRect({ maxWidth: 380, baseHeight: 320, minHeight: 250 });
+	const horizontalPadding = clamp(30 * popup.scale, 18, 34);
+	const inputHeight = clamp(40 * popup.scale, 36, 46);
+	const gap = clamp(10 * popup.scale, 6, 12);
+	const buttonHeight = clamp(42 * popup.scale, 38, 46);
+	const bottomPadding = clamp(24 * popup.scale, 18, 28);
+	const inputY = popup.y + clamp(145 * popup.scale, 120, popup.height - 140);
+	const buttonY = popup.y + popup.height - bottomPadding - buttonHeight;
+	const buttonWidth = Math.floor((popup.width - horizontalPadding * 2 - gap) / 2);
+	return {
+		popup,
+		input: {
+			x: popup.x + horizontalPadding,
+			y: inputY,
+			width: popup.width - horizontalPadding * 2,
+			height: inputHeight,
+		},
+		playButton: {
+			x: popup.x + horizontalPadding,
+			y: buttonY,
+			width: buttonWidth,
+			height: buttonHeight,
+		},
+		scoreButton: {
+			x: popup.x + horizontalPadding + buttonWidth + gap,
+			y: buttonY,
+			width: buttonWidth,
+			height: buttonHeight,
+		},
+	};
+};
+
+const getScoreboardLayout = () => {
+	const popup = getCenteredPopupRect({ maxWidth: 380, baseHeight: 400, minHeight: 300 });
+	const buttonHeight = clamp(42 * popup.scale, 38, 46);
+	const buttonWidth = Math.min(180 * popup.scale, popup.width - 48);
+	return {
+		popup,
+		button: {
+			x: viewportWidth / 2 - buttonWidth / 2,
+			y: popup.y + popup.height - buttonHeight - clamp(18 * popup.scale, 12, 22),
+			width: buttonWidth,
+			height: buttonHeight,
+		},
+	};
+};
+
+const loadHighScores = async (force = false) => {
+	if (!firebaseReady || !firebaseDb) {
+		return;
+	}
+	const now = Date.now();
+	if (!force && (leaderboardLoading || (now - leaderboardLastFetch < LEADERBOARD_REFRESH_MS && highScores.length > 0))) {
+		return;
+	}
+	leaderboardLoading = true;
+	try {
+		const snapshot = await firebaseDb
+			.collection(PLAYER_COLLECTION)
+			.orderBy("bestScore", "desc")
+			.limit(10)
+			.get();
+		highScores = snapshot.docs.map((doc) => {
+			const data = doc.data() || {};
+			return {
+				id: doc.id,
+				name: data.name || "Oyuncu",
+				score: Number.isFinite(data.bestScore) ? data.bestScore : 0,
+				level: Number.isFinite(data.bestLevel) ? data.bestLevel : 1,
+			};
+		});
+		leaderboardLastFetch = now;
+	} catch (error) {
+		console.error("Leaderboard yüklenemedi", error);
+	} finally {
+		leaderboardLoading = false;
+	}
+};
+
+const writePlayerProfile = async ({ name, score, level }) => {
+	const playerRef = getPlayerDocRef();
+	if (!playerRef) {
+		return;
+	}
+	const cleanName = sanitizeName(name);
+	if (!cleanName) {
+		return;
+	}
+	const candidateScore = Math.max(0, Math.floor(score || 0));
+	const candidateLevel = Math.max(1, Math.floor(level || 1));
+	const snapshot = await playerRef.get();
+	const current = snapshot.exists ? (snapshot.data() || {}) : {};
+	const bestScore = Math.max(Number(current.bestScore) || 0, candidateScore);
+	const bestLevel = Math.max(Number(current.bestLevel) || 1, candidateLevel);
+	bestScoreCache = bestScore;
+	bestLevelCache = bestLevel;
+	await playerRef.set(
+		{
+			deviceId,
+			name: cleanName,
+			bestScore,
+			bestLevel,
+			updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+			createdAt: current.createdAt || firebase.firestore.FieldValue.serverTimestamp(),
+		},
+		{ merge: true }
+	);
+	leaderboardLastFetch = 0;
+};
+
+const syncPlayerProfile = async (payload) => {
+	latestProfileSyncPayload = payload;
+	if (profileSyncTimer) {
+		clearTimeout(profileSyncTimer);
+	}
+	profileSyncTimer = setTimeout(() => {
+		const toSync = latestProfileSyncPayload;
+		latestProfileSyncPayload = null;
+		profileSyncChain = profileSyncChain
+			.then(async () => {
+				if (!toSync) {
+					return;
+				}
+				try {
+					await writePlayerProfile(toSync);
+				} catch (error) {
+					const shouldRetry = error && typeof error.code === "string" && error.code.includes("failed-precondition");
+					if (shouldRetry) {
+						await new Promise((resolve) => setTimeout(resolve, 140));
+						await writePlayerProfile(toSync);
+					} else {
+						throw error;
+					}
+				}
+			})
+			.catch((error) => {
+				console.error("Profil senkronize edilemedi", error);
+			});
+	}, 180);
+};
+
+const loadPlayerProfile = async () => {
+	const playerRef = getPlayerDocRef();
+	if (!playerRef) {
+		return;
+	}
+	try {
+		const snapshot = await playerRef.get();
+		if (snapshot.exists) {
+			const data = snapshot.data() || {};
+			const savedName = sanitizeName(data.name);
+			bestScoreCache = Math.max(0, Number(data.bestScore) || 0);
+			bestLevelCache = Math.max(1, Number(data.bestLevel) || 1);
+			if (savedName) {
+				applyUsername(savedName, { syncRemote: false });
+				showScoreboard = false;
+			}
+		}
+	} catch (error) {
+		console.error("Profil yüklenemedi", error);
+	}
+};
+
+const initFirebase = async () => {
+	if (!window.firebase) {
+		return;
+	}
+	if (!firebase.apps.length) {
+		firebase.initializeApp(firebaseConfig);
+	}
+	firebaseDb = firebase.firestore();
+	firebaseReady = true;
+	deviceId = getOrCreateDeviceId();
+	await loadPlayerProfile();
+	await loadHighScores(true);
+};
+
 const resizeCanvas = () => {
 	const { width, height } = getViewportSize();
-	canvas.width = width;
-	canvas.height = height;
+	viewportWidth = width;
+	viewportHeight = height;
+	renderScale = clamp(window.devicePixelRatio || 1, 1, 2.4);
+	canvas.style.width = `${viewportWidth}px`;
+	canvas.style.height = `${viewportHeight}px`;
+	canvas.width = Math.max(1, Math.floor(viewportWidth * renderScale));
+	canvas.height = Math.max(1, Math.floor(viewportHeight * renderScale));
+	ctx.setTransform(renderScale, 0, 0, renderScale, 0, 0);
+	ctx.imageSmoothingEnabled = true;
 	if (player.x === 0 && player.y === 0) {
-		player.x = canvas.width * 0.3;
-		player.y = canvas.height * 0.5;
+		player.x = width * 0.3;
+		player.y = height * 0.5;
+		return;
 	}
+	player.x = clamp(player.x, player.radius, width - player.radius);
+	player.y = clamp(player.y, player.radius, height - player.radius);
 };
 
 const randomInRange = (min, max) => min + Math.random() * (max - min);
@@ -184,18 +548,18 @@ const createExplosion = (x, y, intensity = 1, palette = "damage") => {
 };
 
 const drawCoverImage = (image) => {
-	const canvasRatio = canvas.width / canvas.height;
+	const canvasRatio = viewportWidth / viewportHeight;
 	const imageRatio = image.width / image.height;
-	let drawWidth = canvas.width;
-	let drawHeight = canvas.height;
+	let drawWidth = viewportWidth;
+	let drawHeight = viewportHeight;
 	let drawX = 0;
 	let drawY = 0;
 	if (imageRatio > canvasRatio) {
-		drawWidth = canvas.height * imageRatio;
-		drawX = (canvas.width - drawWidth) / 2;
+		drawWidth = viewportHeight * imageRatio;
+		drawX = (viewportWidth - drawWidth) / 2;
 	} else {
-		drawHeight = canvas.width / imageRatio;
-		drawY = (canvas.height - drawHeight) / 2;
+		drawHeight = viewportWidth / imageRatio;
+		drawY = (viewportHeight - drawHeight) / 2;
 	}
 	ctx.drawImage(image, drawX, drawY, drawWidth, drawHeight);
 };
@@ -205,8 +569,8 @@ const spawnParticle = () => {
 		return;
 	}
 	particles.push({
-		x: randomInRange(20, canvas.width - 20),
-		y: randomInRange(20, canvas.height - 20),
+		x: randomInRange(20, viewportWidth - 20),
+		y: randomInRange(20, viewportHeight - 20),
 		radius: randomInRange(3, 6),
 		alpha: 1,
 	});
@@ -219,8 +583,8 @@ const spawnAsteroid = (maxLimit = maxAsteroids) => {
 	const fromRight = Math.random() > 0.5;
 	const size = randomInRange(14, 28);
 	asteroids.push({
-		x: fromRight ? canvas.width + size : randomInRange(0, canvas.width),
-		y: fromRight ? randomInRange(0, canvas.height) : -size,
+		x: fromRight ? viewportWidth + size : randomInRange(0, viewportWidth),
+		y: fromRight ? randomInRange(0, viewportHeight) : -size,
 		radius: size,
 		vx: fromRight ? -randomInRange(0.18, 0.45) : randomInRange(-0.18, 0.18),
 		vy: fromRight ? randomInRange(-0.12, 0.12) : randomInRange(0.18, 0.45),
@@ -235,9 +599,9 @@ const spawnUfo = () => {
 	}
 	const fromLeft = Math.random() > 0.5;
 	const size = randomInRange(24, 36);
-	const y = randomInRange(canvas.height * 0.2, canvas.height * 0.8);
+	const y = randomInRange(viewportHeight * 0.2, viewportHeight * 0.8);
 	ufos.push({
-		x: fromLeft ? -size : canvas.width + size,
+		x: fromLeft ? -size : viewportWidth + size,
 		y,
 		radius: size * 0.45,
 		vx: fromLeft ? randomInRange(0.6, 1.2) : -randomInRange(0.6, 1.2),
@@ -253,9 +617,9 @@ const spawnAlien = () => {
 	}
 	const fromLeft = Math.random() > 0.5;
 	const size = randomInRange(16, 24);
-	const y = randomInRange(canvas.height * 0.15, canvas.height * 0.85);
+	const y = randomInRange(viewportHeight * 0.15, viewportHeight * 0.85);
 	aliens.push({
-		x: fromLeft ? -size : canvas.width + size,
+		x: fromLeft ? -size : viewportWidth + size,
 		y,
 		radius: size * 0.4,
 		vx: fromLeft ? randomInRange(0.25, 0.55) : -randomInRange(0.25, 0.55),
@@ -271,8 +635,8 @@ const spawnPlanet = () => {
 		return;
 	}
 	planets.push({
-		x: randomInRange(40, canvas.width - 40),
-		y: randomInRange(40, canvas.height - 40),
+		x: randomInRange(40, viewportWidth - 40),
+		y: randomInRange(40, viewportHeight - 40),
 		radius: randomInRange(12, 20),
 		alpha: 1,
 	});
@@ -285,34 +649,57 @@ const handlePressStart = (event) => {
 		return;
 	}
 	if (showScoreboard) {
-		showScoreboard = false;
 		return;
 	}
 	const clientX = getPointerX(event);
 	const clientY = getPointerY(event);
 	if (showConfirmHome) {
 		const { x, y } = getCanvasCoords(clientX, clientY);
-		const { yes, no } = getConfirmHomeButtons();
+		const { continueGame, home, restart, scoreboard } = getConfirmHomeButtons();
 		if (
-			x >= yes.x &&
-			x <= yes.x + yes.width &&
-			y >= yes.y &&
-			y <= yes.y + yes.height
+			x >= continueGame.x &&
+			x <= continueGame.x + continueGame.width &&
+			y >= continueGame.y &&
+			y <= continueGame.y + continueGame.height
+		) {
+			showConfirmHome = false;
+			return;
+		}
+		if (
+			x >= home.x &&
+			x <= home.x + home.width &&
+			y >= home.y &&
+			y <= home.y + home.height
 		) {
 			showConfirmHome = false;
 			resetGame();
 			showLandingPage = true;
 			showScoreboard = false;
+			scoreboardSource = "landing";
 			usernameInput.blur();
 			return;
 		}
 		if (
-			x >= no.x &&
-			x <= no.x + no.width &&
-			y >= no.y &&
-			y <= no.y + no.height
+			x >= restart.x &&
+			x <= restart.x + restart.width &&
+			y >= restart.y &&
+			y <= restart.y + restart.height
 		) {
 			showConfirmHome = false;
+			resetGame();
+			startGame();
+			return;
+		}
+		if (
+			x >= scoreboard.x &&
+			x <= scoreboard.x + scoreboard.width &&
+			y >= scoreboard.y &&
+			y <= scoreboard.y + scoreboard.height
+		) {
+			showConfirmHome = false;
+			showScoreboard = true;
+			scoreboardSource = "pause";
+			void loadHighScores(true);
 			return;
 		}
 		return;
@@ -341,8 +728,9 @@ const handlePressStart = (event) => {
 	}
 	isPressing = true;
 	player.velocity = -lift;
-	targetX = clientX;
-	targetY = clientY;
+	const pointerPos = getCanvasCoords(clientX, clientY);
+	targetX = pointerPos.x;
+	targetY = pointerPos.y;
 	playWoosh();
 };
 
@@ -356,8 +744,9 @@ const handlePointerMove = (event) => {
 		return;
 	}
 	event.preventDefault();
-	targetX = getPointerX(event);
-	targetY = getPointerY(event);
+	const pointerPos = getCanvasCoords(getPointerX(event), getPointerY(event));
+	targetX = pointerPos.x;
+	targetY = pointerPos.y;
 };
 
 const getPointerX = (event) => {
@@ -389,15 +778,15 @@ const getCanvasCoords = (clientX, clientY) => {
 };
 
 const getHomeButtonRect = (shieldVisible) => {
-	const headerPadding = 16;
-	const buttonWidth = 110;
-	const buttonHeight = 32;
-	const buttonY = 14;
-	const shieldBoxWidth = 80;
-	const gap = 10;
+	const { scale, padding, topInset } = getHeaderMetrics();
+	const buttonWidth = clamp(110 * scale, 88, 126);
+	const buttonHeight = clamp(32 * scale, 28, 38);
+	const buttonY = topInset + Math.max(8, 14 * scale);
+	const shieldBoxWidth = clamp(80 * scale, 66, 92);
+	const gap = Math.max(8, 10 * scale);
 	const rightEdge = shieldVisible
-		? canvas.width - headerPadding - shieldBoxWidth - gap
-		: canvas.width - headerPadding;
+		? viewportWidth - padding - shieldBoxWidth - gap
+		: viewportWidth - padding;
 	const buttonX = rightEdge - buttonWidth;
 	return {
 		x: buttonX,
@@ -408,23 +797,35 @@ const getHomeButtonRect = (shieldVisible) => {
 };
 
 const getConfirmHomeButtons = () => {
-	const popupWidth = Math.min(320, canvas.width - 40);
-	const popupHeight = 200;
-	const popupX = canvas.width / 2 - popupWidth / 2;
-	const popupY = canvas.height / 2 - popupHeight / 2;
-	const btnWidth = 120;
-	const btnHeight = 40;
-	const btnY = popupY + popupHeight - 65;
-	const btnYesX = popupX + 20;
-	const btnNoX = popupX + popupWidth - btnWidth - 20;
+	const popup = getCenteredPopupRect({ maxWidth: 320, baseHeight: 300, minHeight: 250 });
+	const sidePadding = clamp(18 * popup.scale, 14, 22);
+	const btnWidth = popup.width - sidePadding * 2;
+	const btnHeight = clamp(38 * popup.scale, 34, 44);
+	const firstY = popup.y + clamp(66 * popup.scale, 58, 78);
+	const gap = clamp(10 * popup.scale, 8, 12);
 	return {
-		popup: { x: popupX, y: popupY, width: popupWidth, height: popupHeight },
-		yes: { x: btnYesX, y: btnY, width: btnWidth, height: btnHeight },
-		no: { x: btnNoX, y: btnY, width: btnWidth, height: btnHeight },
+		popup,
+		continueGame: { x: popup.x + sidePadding, y: firstY, width: btnWidth, height: btnHeight },
+		home: { x: popup.x + sidePadding, y: firstY + btnHeight + gap, width: btnWidth, height: btnHeight },
+		restart: { x: popup.x + sidePadding, y: firstY + (btnHeight + gap) * 2, width: btnWidth, height: btnHeight },
+		scoreboard: { x: popup.x + sidePadding, y: firstY + (btnHeight + gap) * 3, width: btnWidth, height: btnHeight },
 	};
 };
 
 window.addEventListener("resize", resizeCanvas);
+window.addEventListener("orientationchange", resizeCanvas);
+window.addEventListener("visibilitychange", () => {
+	if (!document.hidden) {
+		return;
+	}
+	isPressing = false;
+	if (isTypingName) {
+		closeUsernameEditor();
+	}
+	if (isGameStarted && !isGameOver && !showLandingPage && !showScoreboard && !showConfirmHome && !isStageComplete) {
+		showConfirmHome = true;
+	}
+});
 if (window.visualViewport) {
 	window.visualViewport.addEventListener("resize", resizeCanvas);
 	window.visualViewport.addEventListener("scroll", resizeCanvas);
@@ -435,6 +836,7 @@ canvas.addEventListener("mouseleave", handlePressEnd);
 canvas.addEventListener("mousemove", handlePointerMove);
 canvas.addEventListener("touchstart", handlePressStart, { passive: false });
 canvas.addEventListener("touchend", handlePressEnd, { passive: false });
+canvas.addEventListener("touchcancel", handlePressEnd, { passive: false });
 canvas.addEventListener("touchmove", handlePointerMove, { passive: false });
 
 window.addEventListener("keydown", (e) => {
@@ -448,7 +850,7 @@ window.addEventListener("keydown", (e) => {
 		} else if (e.key === "Enter") {
 			e.preventDefault();
 			if (tempUsername.trim()) {
-				username = tempUsername.trim();
+				applyUsername(tempUsername.trim());
 				showLandingPage = false;
 				usernameInput.blur();
 			}
@@ -460,96 +862,122 @@ window.addEventListener("keydown", (e) => {
 
 usernameInput.addEventListener("input", (e) => {
 	if (showLandingPage) {
-		tempUsername = e.target.value;
+		tempUsername = sanitizeName(e.target.value);
+		if (e.target.value !== tempUsername) {
+			e.target.value = tempUsername;
+		}
+		if (tempUsername) {
+			landingWarning = "";
+		}
 	}
 });
 
 usernameInput.addEventListener("focus", () => {
 	isTypingName = true;
+	lockViewportForKeyboard();
 });
 
 usernameInput.addEventListener("blur", () => {
 	isTypingName = false;
+	unlockViewportForKeyboard();
+	resizeCanvas();
+	usernameInput.style.pointerEvents = "none";
+	usernameInput.style.opacity = "0";
+	usernameInput.style.background = "transparent";
+	usernameInput.style.border = "none";
+	usernameInput.style.color = "#fff";
 	if (showLandingPage && tempUsername.trim()) {
-		username = tempUsername.trim();
+		applyUsername(tempUsername.trim());
 	}
 });
+
+const closeUsernameEditor = () => {
+	isTypingName = false;
+	unlockViewportForKeyboard();
+	usernameInput.blur();
+	resizeCanvas();
+	usernameInput.style.pointerEvents = "none";
+	usernameInput.style.opacity = "0";
+	usernameInput.style.background = "transparent";
+	usernameInput.style.border = "none";
+	usernameInput.style.color = "#fff";
+};
 
 const handleLandingInteraction = (clientX, clientY) => {
 	const rect = canvas.getBoundingClientRect();
 	const x = clientX - rect.left;
 	const y = clientY - rect.top;
 	if (showLandingPage) {
-		const popupWidth = Math.min(380, canvas.width - 40);
-		const popupHeight = 320;
-		const popupX = canvas.width / 2 - popupWidth / 2;
-		const popupY = canvas.height / 2 - popupHeight / 2;
+		const layout = getLandingLayout();
+		const { input, playButton, scoreButton } = layout;
 
-		const inputWidth = popupWidth - 60;
-		const inputHeight = 40;
-		const inputX = popupX + 30;
-		const inputY = popupY + 145;
-
-		if (x >= inputX && x <= inputX + inputWidth && y >= inputY && y <= inputY + inputHeight) {
+		if (x >= input.x && x <= input.x + input.width && y >= input.y && y <= input.y + input.height) {
 			usernameInput.style.pointerEvents = "auto";
 			usernameInput.style.opacity = "1";
-			usernameInput.style.left = rect.left + inputX + "px";
-			usernameInput.style.top = rect.top + inputY + "px";
-			usernameInput.style.width = inputWidth + "px";
-			usernameInput.style.height = inputHeight + "px";
+			usernameInput.style.left = `${rect.left + input.x}px`;
+			usernameInput.style.top = `${rect.top + input.y}px`;
+			usernameInput.style.width = `${input.width}px`;
+			usernameInput.style.height = `${input.height}px`;
+			usernameInput.style.background = "rgba(18, 24, 38, 0.9)";
+			usernameInput.style.border = "1.5px solid rgba(122, 208, 255, 0.95)";
+			usernameInput.style.color = "rgba(240, 246, 255, 0.98)";
 			usernameInput.value = tempUsername;
 			usernameInput.focus();
+			landingWarning = "";
 			return;
 		}
 
-		const btn1Width = 150;
-		const btn1Height = 42;
-		const btn1X = canvas.width / 2 - btn1Width - 10;
-		const btn1Y = popupY + popupHeight - 75;
-
-		if (x >= btn1X && x <= btn1X + btn1Width && y >= btn1Y && y <= btn1Y + btn1Height) {
-			if (tempUsername.trim()) {
-				username = tempUsername.trim();
+		if (
+			x >= playButton.x &&
+			x <= playButton.x + playButton.width &&
+			y >= playButton.y &&
+			y <= playButton.y + playButton.height
+		) {
+			if (hasValidTempUsername()) {
+				applyUsername(tempUsername.trim());
 				showLandingPage = false;
-				usernameInput.style.pointerEvents = "none";
-				usernameInput.style.opacity = "0";
+				closeUsernameEditor();
+			} else {
+				landingWarning = "Kullanıcı adı boş bırakılamaz.";
 			}
 		}
 
-		const btn2Width = 150;
-		const btn2Height = 42;
-		const btn2X = canvas.width / 2 + 10;
-		const btn2Y = popupY + popupHeight - 75;
-
-		if (x >= btn2X && x <= btn2X + btn2Width && y >= btn2Y && y <= btn2Y + btn2Height) {
+		if (
+			x >= scoreButton.x &&
+			x <= scoreButton.x + scoreButton.width &&
+			y >= scoreButton.y &&
+			y <= scoreButton.y + scoreButton.height
+		) {
 			showLandingPage = false;
 			showScoreboard = true;
-			usernameInput.style.pointerEvents = "none";
-			usernameInput.style.opacity = "0";
+			scoreboardSource = "landing";
+			void loadHighScores(true);
+			closeUsernameEditor();
 		}
 	} else if (showScoreboard) {
-		const popupWidth = Math.min(380, canvas.width - 40);
-		const popupHeight = 400;
-		const popupX = canvas.width / 2 - popupWidth / 2;
-		const popupY = canvas.height / 2 - popupHeight / 2;
+		const { button } = getScoreboardLayout();
 
-		const btnWidth = 180;
-		const btnHeight = 42;
-		const btnX = canvas.width / 2 - btnWidth / 2;
-		const btnY = popupY + popupHeight - 60;
-
-		if (x >= btnX && x <= btnX + btnWidth && y >= btnY && y <= btnY + btnHeight) {
+		if (x >= button.x && x <= button.x + button.width && y >= button.y && y <= button.y + button.height) {
 			showScoreboard = false;
-			showLandingPage = true;
+			closeUsernameEditor();
+			if (scoreboardSource === "pause") {
+				showConfirmHome = true;
+			} else {
+				showLandingPage = true;
+			}
 		}
 	}
 };
 
 canvas.addEventListener("click", (e) => {
+	if (Date.now() - lastTouchInteraction < 450) {
+		return;
+	}
 	handleLandingInteraction(e.clientX, e.clientY);
 });
 
 canvas.addEventListener("touchstart", (e) => {
+	lastTouchInteraction = Date.now();
 	const touch = e.touches[0];
 	if (!touch) {
 		return;
@@ -567,6 +995,9 @@ const update = () => {
 	if (isStageComplete) {
 		return;
 	}
+	if (showScoreboard) {
+		return;
+	}
 	if (showConfirmHome) {
 		return;
 	}
@@ -581,9 +1012,9 @@ const update = () => {
 	}
 
 	const topLimit = player.radius;
-	const bottomLimit = canvas.height - player.radius;
+	const bottomLimit = viewportHeight - player.radius;
 	const leftLimit = player.radius;
-	const rightLimit = canvas.width - player.radius;
+	const rightLimit = viewportWidth - player.radius;
 
 	if (player.y < topLimit) {
 		player.y = topLimit;
@@ -636,13 +1067,13 @@ const update = () => {
 		lastAsteroidSpawn = now;
 	}
 
-	const isUfoStage = stageTargets[currentStage] === 70;
+	const isUfoStage = currentStage >= 3;
 	if (isUfoStage && now - lastUfoSpawn > ufoSpawnInterval) {
 		spawnUfo();
 		lastUfoSpawn = now;
 	}
 
-	const isAlienStage = stageTargets[currentStage] > 80;
+	const isAlienStage = currentStage >= 4;
 	if (isAlienStage && now - lastAlienSpawn > alienSpawnInterval) {
 		spawnAlien();
 		lastAlienSpawn = now;
@@ -657,8 +1088,8 @@ const update = () => {
 		if (distance < player.radius + particle.radius) {
 			lastCollectTime = now;
 			score += 1;
-			shakeTime = 8;
-			shakeIntensity = 6;
+			shakeTime = 4;
+			shakeIntensity = 1.6;
 			playTing();
 			particles.splice(i, 1);
 			checkStageComplete();
@@ -674,8 +1105,8 @@ const update = () => {
 		const distance = Math.hypot(dx, dy);
 		if (distance < player.radius + planet.radius) {
 			shieldCount += 1;
-			shakeTime = 10;
-			shakeIntensity = 8;
+			shakeTime = 5;
+			shakeIntensity = 2.2;
 			playTing();
 			planets.splice(i, 1);
 			checkStageComplete();
@@ -713,9 +1144,9 @@ const update = () => {
 
 		if (
 			asteroid.x < -60 ||
-			asteroid.x > canvas.width + 60 ||
+			asteroid.x > viewportWidth + 60 ||
 			asteroid.y < -60 ||
-			asteroid.y > canvas.height + 60
+			asteroid.y > viewportHeight + 60
 		) {
 			asteroids.splice(i, 1);
 		}
@@ -746,7 +1177,7 @@ const update = () => {
 			break;
 		}
 
-		if (ufo.x < -80 || ufo.x > canvas.width + 80 || ufo.y < -80 || ufo.y > canvas.height + 80) {
+		if (ufo.x < -80 || ufo.x > viewportWidth + 80 || ufo.y < -80 || ufo.y > viewportHeight + 80) {
 			ufos.splice(i, 1);
 		}
 	}
@@ -779,7 +1210,7 @@ const update = () => {
 			break;
 		}
 
-		if (alien.x < -80 || alien.x > canvas.width + 80 || alien.y < -80 || alien.y > canvas.height + 80) {
+		if (alien.x < -80 || alien.x > viewportWidth + 80 || alien.y < -80 || alien.y > viewportHeight + 80) {
 			aliens.splice(i, 1);
 		}
 	}
@@ -853,82 +1284,89 @@ const drawExplosions = () => {
 };
 
 const draw = () => {
-	ctx.clearRect(0, 0, canvas.width, canvas.height);
+	ctx.clearRect(0, 0, viewportWidth, viewportHeight);
 	if (showLandingPage && landingBgReady) {
 		ctx.save();
 		ctx.globalCompositeOperation = "source-over";
 		ctx.filter = "saturate(1.25) contrast(1.12) brightness(1.05)";
 		drawCoverImage(landingBgImage);
 		ctx.filter = "none";
-		const grade = ctx.createLinearGradient(0, 0, 0, canvas.height);
+		const grade = ctx.createLinearGradient(0, 0, 0, viewportHeight);
 		grade.addColorStop(0, "rgba(20, 10, 40, 0.15)");
 		grade.addColorStop(0.5, "rgba(10, 20, 40, 0.05)");
 		grade.addColorStop(1, "rgba(0, 0, 0, 0.35)");
 		ctx.fillStyle = grade;
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 		ctx.globalCompositeOperation = "lighter";
 		const neon1 = ctx.createRadialGradient(
-			canvas.width * 0.15,
-			canvas.height * 0.2,
+			viewportWidth * 0.15,
+			viewportHeight * 0.2,
 			0,
-			canvas.width * 0.15,
-			canvas.height * 0.2,
-			Math.max(canvas.width, canvas.height) * 0.35
+			viewportWidth * 0.15,
+			viewportHeight * 0.2,
+			Math.max(viewportWidth, viewportHeight) * 0.35
 		);
 		neon1.addColorStop(0, "rgba(255, 200, 120, 0.28)");
 		neon1.addColorStop(1, "rgba(255, 200, 120, 0)");
 		ctx.fillStyle = neon1;
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 
 		const neon2 = ctx.createRadialGradient(
-			canvas.width * 0.85,
-			canvas.height * 0.25,
+			viewportWidth * 0.85,
+			viewportHeight * 0.25,
 			0,
-			canvas.width * 0.85,
-			canvas.height * 0.25,
-			Math.max(canvas.width, canvas.height) * 0.3
+			viewportWidth * 0.85,
+			viewportHeight * 0.25,
+			Math.max(viewportWidth, viewportHeight) * 0.3
 		);
 		neon2.addColorStop(0, "rgba(120, 200, 255, 0.25)");
 		neon2.addColorStop(1, "rgba(120, 200, 255, 0)");
 		ctx.fillStyle = neon2;
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 
 		const neon3 = ctx.createRadialGradient(
-			canvas.width * 0.5,
-			canvas.height * 0.85,
+			viewportWidth * 0.5,
+			viewportHeight * 0.85,
 			0,
-			canvas.width * 0.5,
-			canvas.height * 0.85,
-			Math.max(canvas.width, canvas.height) * 0.28
+			viewportWidth * 0.5,
+			viewportHeight * 0.85,
+			Math.max(viewportWidth, viewportHeight) * 0.28
 		);
 		neon3.addColorStop(0, "rgba(255, 140, 220, 0.2)");
 		neon3.addColorStop(1, "rgba(255, 140, 220, 0)");
 		ctx.fillStyle = neon3;
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 		ctx.globalCompositeOperation = "source-over";
 		const vignette = ctx.createRadialGradient(
-			canvas.width / 2,
-			canvas.height / 2,
-			Math.min(canvas.width, canvas.height) * 0.2,
-			canvas.width / 2,
-			canvas.height / 2,
-			Math.max(canvas.width, canvas.height) * 0.7
+			viewportWidth / 2,
+			viewportHeight / 2,
+			Math.min(viewportWidth, viewportHeight) * 0.2,
+			viewportWidth / 2,
+			viewportHeight / 2,
+			Math.max(viewportWidth, viewportHeight) * 0.7
 		);
 		vignette.addColorStop(0, "rgba(0, 0, 0, 0)");
 		vignette.addColorStop(1, "rgba(0, 0, 0, 0.45)");
 		ctx.fillStyle = vignette;
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 		ctx.restore();
 	}
 	ctx.save();
 	ctx.globalCompositeOperation = "lighter";
 
 	if (shakeTime > 0) {
-		const offsetX = (Math.random() - 0.5) * shakeIntensity;
-		const offsetY = (Math.random() - 0.5) * shakeIntensity;
-		ctx.translate(offsetX, offsetY);
+		shakePhase += 0.55;
+		const targetX = Math.sin(shakePhase) * shakeIntensity;
+		const targetY = Math.cos(shakePhase * 1.3) * shakeIntensity * 0.65;
+		shakeOffsetX += (targetX - shakeOffsetX) * 0.4;
+		shakeOffsetY += (targetY - shakeOffsetY) * 0.4;
+		ctx.translate(shakeOffsetX, shakeOffsetY);
 		shakeTime -= 1;
-		shakeIntensity *= 0.9;
+		shakeIntensity *= 0.84;
+	} else if (Math.abs(shakeOffsetX) > 0.01 || Math.abs(shakeOffsetY) > 0.01) {
+		shakeOffsetX *= 0.75;
+		shakeOffsetY *= 0.75;
+		ctx.translate(shakeOffsetX, shakeOffsetY);
 	}
 
 	const visibleTrail = trail.filter((point) => point.alpha > 0);
@@ -1121,9 +1559,9 @@ const draw = () => {
 		ctx.restore();
 	}
 
-	const totalStages = Math.max(1, stageTargets.length - 1);
-	const stageProgress = Math.min(1, currentStage / totalStages);
-	const t = Math.min(1, stageProgress * 0.9 + (score / (stageTargets[currentStage] || 1)) * 0.1);
+	const currentTarget = getStageTarget(currentStage);
+	const stageProgress = Math.min(1, currentStage / 18);
+	const t = Math.min(1, stageProgress * 0.8 + (score / currentTarget) * 0.2);
 	const startColor = { r: 255, g: 255, b: 255 };
 	const endColor = { r: 255, g: 80, b: 80 };
 	const r = Math.round(startColor.r + (endColor.r - startColor.r) * t);
@@ -1154,87 +1592,138 @@ const draw = () => {
 	if (isGameOver) {
 		ctx.save();
 		ctx.fillStyle = "rgba(255, 0, 0, 0.2)";
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 		ctx.restore();
 	}
 
 	ctx.save();
-	
-	const headerHeight = 60;
-	const headerPadding = 16;
-	ctx.fillStyle = "rgba(10, 15, 25, 0.75)";
-	ctx.fillRect(0, 0, canvas.width, headerHeight);
 
-	const scoreBoxWidth = Math.max(180, canvas.width * 0.35);
-	const scoreBoxHeight = 36;
+	const header = getHeaderMetrics();
+	const headerHeight = header.height;
+	const headerPadding = header.padding;
+	const headerGradient = ctx.createLinearGradient(0, 0, viewportWidth, headerHeight);
+	headerGradient.addColorStop(0, "rgba(8, 16, 35, 0.88)");
+	headerGradient.addColorStop(0.55, "rgba(18, 20, 52, 0.84)");
+	headerGradient.addColorStop(1, "rgba(8, 28, 46, 0.86)");
+	ctx.fillStyle = headerGradient;
+	ctx.fillRect(0, 0, viewportWidth, headerHeight);
+	const topGlow = ctx.createLinearGradient(0, 0, viewportWidth, 0);
+	topGlow.addColorStop(0, "rgba(88, 170, 255, 0.0)");
+	topGlow.addColorStop(0.3, "rgba(88, 170, 255, 0.7)");
+	topGlow.addColorStop(0.65, "rgba(120, 255, 220, 0.65)");
+	topGlow.addColorStop(1, "rgba(120, 255, 220, 0.0)");
+	ctx.fillStyle = topGlow;
+	ctx.fillRect(0, 0, viewportWidth, 2);
+
+	const scoreBoxWidth = Math.max(160, viewportWidth * Math.min(0.4, 0.32 + 0.08 * header.scale));
+	const scoreBoxHeight = clamp(36 * header.scale, 30, 40);
 	const scoreBoxX = headerPadding;
-	const scoreBoxY = 12;
-	ctx.fillStyle = "rgba(30, 35, 50, 0.85)";
+	const scoreBoxY = header.topInset + Math.max(8, 12 * header.scale);
+	const scoreCardGradient = ctx.createLinearGradient(scoreBoxX, scoreBoxY, scoreBoxX + scoreBoxWidth, scoreBoxY + scoreBoxHeight);
+	scoreCardGradient.addColorStop(0, "rgba(22, 32, 64, 0.92)");
+	scoreCardGradient.addColorStop(1, "rgba(20, 24, 44, 0.9)");
+	ctx.fillStyle = scoreCardGradient;
 	ctx.beginPath();
 	ctx.roundRect(scoreBoxX, scoreBoxY, scoreBoxWidth, scoreBoxHeight, 8);
 	ctx.fill();
+	ctx.strokeStyle = "rgba(110, 170, 255, 0.5)";
+	ctx.lineWidth = 1.2;
+	ctx.stroke();
 
-	const target = stageTargets[currentStage] || 100;
+	const target = currentTarget;
 	const progress = Math.min(1, score / target);
 	const progressBarWidth = scoreBoxWidth - 8;
 	const progressBarHeight = 6;
 	const progressBarX = scoreBoxX + 4;
 	const progressBarY = scoreBoxY + scoreBoxHeight - 10;
 
-	ctx.fillStyle = "rgba(60, 65, 80, 0.8)";
+	ctx.fillStyle = "rgba(70, 84, 120, 0.6)";
 	ctx.beginPath();
 	ctx.roundRect(progressBarX, progressBarY, progressBarWidth, progressBarHeight, 3);
 	ctx.fill();
 
 	const progressGradient = ctx.createLinearGradient(
-		progressBarX, 
-		progressBarY, 
-		progressBarX + progressBarWidth * progress, 
+		progressBarX,
+		progressBarY,
+		progressBarX + progressBarWidth * progress,
 		progressBarY
 	);
-	progressGradient.addColorStop(0, "rgba(80, 180, 255, 0.9)");
-	progressGradient.addColorStop(1, "rgba(120, 200, 255, 0.9)");
+	progressGradient.addColorStop(0, "rgba(72, 188, 255, 0.98)");
+	progressGradient.addColorStop(0.6, "rgba(86, 220, 255, 0.98)");
+	progressGradient.addColorStop(1, "rgba(130, 255, 218, 0.95)");
 	ctx.fillStyle = progressGradient;
 	ctx.beginPath();
 	ctx.roundRect(progressBarX, progressBarY, progressBarWidth * progress, progressBarHeight, 3);
 	ctx.fill();
+	ctx.shadowColor = "rgba(100, 230, 255, 0.6)";
+	ctx.shadowBlur = 8;
+	ctx.fill();
+	ctx.shadowBlur = 0;
 
 	ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
 	ctx.textAlign = "left";
-	ctx.font = "14px 'Helvetica Neue', Arial, sans-serif";
-	ctx.fillText(`Işık Yılı ${score} / ${target}`, scoreBoxX + 12, scoreBoxY + 18);
+	ctx.font = `${Math.round(clamp(14 * header.scale, 12, 16))}px 'Helvetica Neue', Arial, sans-serif`;
+	ctx.fillText(`Level ${currentStage + 1}  •  Skor ${score}/${target}`, scoreBoxX + 12, scoreBoxY + scoreBoxHeight * 0.5);
 
 	const homeButton = getHomeButtonRect(shieldCount > 0);
-	ctx.fillStyle = "rgba(35, 40, 55, 0.85)";
+	const usernameBoxWidth = Math.min(220, viewportWidth * 0.28);
+	const usernameBoxX = scoreBoxX + scoreBoxWidth + Math.max(8, 10 * header.scale);
+	const usernameBoxY = scoreBoxY;
+	if (usernameBoxX + usernameBoxWidth < homeButton.x - 8) {
+		const userCardGradient = ctx.createLinearGradient(usernameBoxX, usernameBoxY, usernameBoxX + usernameBoxWidth, usernameBoxY + scoreBoxHeight);
+		userCardGradient.addColorStop(0, "rgba(24, 34, 66, 0.9)");
+		userCardGradient.addColorStop(1, "rgba(18, 24, 42, 0.9)");
+		ctx.fillStyle = userCardGradient;
+		ctx.beginPath();
+		ctx.roundRect(usernameBoxX, usernameBoxY, usernameBoxWidth, scoreBoxHeight, 8);
+		ctx.fill();
+		ctx.strokeStyle = "rgba(126, 206, 255, 0.45)";
+		ctx.lineWidth = 1.1;
+		ctx.stroke();
+		ctx.textAlign = "left";
+		ctx.fillStyle = "rgba(216, 242, 255, 0.95)";
+		ctx.font = `${Math.round(clamp(12 * header.scale, 10, 14))}px 'Helvetica Neue', Arial, sans-serif`;
+		const headerName = sanitizeName(username) || sanitizeName(tempUsername) || "Oyuncu";
+		const visibleName = headerName.length > 14 ? `${headerName.slice(0, 14)}...` : headerName;
+		ctx.fillText(`Oyuncu: ${visibleName}`, usernameBoxX + 10, usernameBoxY + scoreBoxHeight * 0.62);
+	}
+
+	const pauseGradient = ctx.createLinearGradient(homeButton.x, homeButton.y, homeButton.x, homeButton.y + homeButton.height);
+	pauseGradient.addColorStop(0, "rgba(255, 172, 90, 0.96)");
+	pauseGradient.addColorStop(1, "rgba(236, 115, 84, 0.94)");
+	ctx.fillStyle = pauseGradient;
 	ctx.beginPath();
 	ctx.roundRect(homeButton.x, homeButton.y, homeButton.width, homeButton.height, 6);
 	ctx.fill();
-	ctx.strokeStyle = "rgba(120, 200, 255, 0.5)";
-	ctx.lineWidth = 1.5;
+	ctx.strokeStyle = "rgba(255, 225, 180, 0.7)";
+	ctx.lineWidth = 1.2;
 	ctx.stroke();
 
-	ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
+	ctx.fillStyle = "rgba(255, 255, 255, 0.98)";
 	ctx.textAlign = "center";
-	ctx.font = "12px 'Helvetica Neue', Arial, sans-serif";
-	ctx.fillText("Ana Sayfa", homeButton.x + homeButton.width / 2, homeButton.y + 20);
+	ctx.font = `${Math.round(clamp(12 * header.scale, 11, 14))}px 'Helvetica Neue', Arial, sans-serif`;
+	ctx.fillText("Duraklat", homeButton.x + homeButton.width / 2, homeButton.y + homeButton.height * 0.62);
 
 	if (shieldCount > 0) {
-		const shieldBoxWidth = 80;
-		const shieldBoxHeight = 32;
-		const shieldBoxX = canvas.width - shieldBoxWidth - headerPadding;
-		const shieldBoxY = 14;
-		ctx.fillStyle = "rgba(30, 50, 45, 0.85)";
+		const shieldBoxWidth = clamp(80 * header.scale, 66, 92);
+		const shieldBoxHeight = clamp(32 * header.scale, 28, 38);
+		const shieldBoxX = viewportWidth - shieldBoxWidth - headerPadding;
+		const shieldBoxY = header.topInset + Math.max(8, 14 * header.scale);
+		const shieldGradient = ctx.createLinearGradient(shieldBoxX, shieldBoxY, shieldBoxX, shieldBoxY + shieldBoxHeight);
+		shieldGradient.addColorStop(0, "rgba(48, 112, 100, 0.94)");
+		shieldGradient.addColorStop(1, "rgba(30, 78, 68, 0.92)");
+		ctx.fillStyle = shieldGradient;
 		ctx.beginPath();
 		ctx.roundRect(shieldBoxX, shieldBoxY, shieldBoxWidth, shieldBoxHeight, 6);
 		ctx.fill();
-		ctx.strokeStyle = "rgba(120, 255, 220, 0.5)";
-		ctx.lineWidth = 1.5;
+		ctx.strokeStyle = "rgba(145, 255, 224, 0.75)";
+		ctx.lineWidth = 1.2;
 		ctx.stroke();
 
-		ctx.fillStyle = "rgba(120, 255, 220, 0.9)";
+		ctx.fillStyle = "rgba(222, 255, 247, 0.98)";
 		ctx.textAlign = "center";
-		ctx.font = "13px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText(`🛡 ${shieldCount}`, shieldBoxX + shieldBoxWidth / 2, shieldBoxY + 21);
+		ctx.font = `${Math.round(clamp(13 * header.scale, 11, 15))}px 'Helvetica Neue', Arial, sans-serif`;
+		ctx.fillText(`🛡 ${shieldCount}`, shieldBoxX + shieldBoxWidth / 2, shieldBoxY + shieldBoxHeight * 0.65);
 	}
 
 	ctx.restore();
@@ -1244,14 +1733,14 @@ const draw = () => {
 		const alpha = Math.min(1, elapsed / 700);
 		ctx.save();
 		ctx.fillStyle = `rgba(0, 0, 0, ${0.7 * alpha})`;
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 		ctx.restore();
 
 		ctx.save();
-		const popupWidth = Math.min(320, canvas.width - 40);
+		const popupWidth = Math.min(320, viewportWidth - 40);
 		const popupHeight = 200;
-		const popupX = canvas.width / 2 - popupWidth / 2;
-		const popupY = canvas.height / 2 - popupHeight / 2;
+		const popupX = viewportWidth / 2 - popupWidth / 2;
+		const popupY = viewportHeight / 2 - popupHeight / 2;
 
 		ctx.shadowColor = `rgba(0, 0, 0, ${0.5 * alpha})`;
 		ctx.shadowBlur = 30 * alpha;
@@ -1268,20 +1757,16 @@ const draw = () => {
 		ctx.textAlign = "center";
 		ctx.fillStyle = `rgba(120, 255, 180, ${alpha})`;
 		ctx.font = "26px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("🎯 Hedef Tamamlandı!", canvas.width / 2, popupY + 65);
+		ctx.fillText("🎯 Level Tamamlandı!", viewportWidth / 2, popupY + 65);
 
 		ctx.fillStyle = `rgba(200, 200, 200, ${0.7 * alpha})`;
 		ctx.font = "13px 'Helvetica Neue', Arial, sans-serif";
-		const nextTarget = stageTargets[currentStage + 1];
-		if (nextTarget) {
-			ctx.fillText(`Sonraki hedef: ${nextTarget} Işık Yılı`, canvas.width / 2, popupY + 95);
-		} else {
-			ctx.fillText("Son seviyeyi tamamladın!", canvas.width / 2, popupY + 95);
-		}
+		const nextTarget = getStageTarget(currentStage + 1);
+		ctx.fillText(`Sonraki: Level ${currentStage + 2} • Hedef ${nextTarget}`, viewportWidth / 2, popupY + 95);
 
 		const btnWidth = 180;
 		const btnHeight = 40;
-		const btnX = canvas.width / 2 - btnWidth / 2;
+		const btnX = viewportWidth / 2 - btnWidth / 2;
 		const btnY = popupY + popupHeight - 60;
 
 		const gradient = ctx.createLinearGradient(btnX, btnY, btnX, btnY + btnHeight);
@@ -1294,7 +1779,7 @@ const draw = () => {
 
 		ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
 		ctx.font = "14px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Devam Et", canvas.width / 2, btnY + 26);
+		ctx.fillText("Devam Et", viewportWidth / 2, btnY + 26);
 		ctx.restore();
 	}
 
@@ -1303,14 +1788,14 @@ const draw = () => {
 		const alpha = Math.min(1, elapsed / 900);
 		ctx.save();
 		ctx.fillStyle = `rgba(0, 0, 0, ${0.7 * alpha})`;
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 		ctx.restore();
 
 		ctx.save();
-		const popupWidth = Math.min(320, canvas.width - 40);
-		const popupHeight = 180;
-		const popupX = canvas.width / 2 - popupWidth / 2;
-		const popupY = canvas.height / 2 - popupHeight / 2;
+		const popupWidth = Math.min(320, viewportWidth - 40);
+		const popupHeight = 280; // Increased height for more buttons
+		const popupX = viewportWidth / 2 - popupWidth / 2;
+		const popupY = viewportHeight / 2 - popupHeight / 2;
 
 		ctx.shadowColor = `rgba(0, 0, 0, ${0.5 * alpha})`;
 		ctx.shadowBlur = 30 * alpha;
@@ -1327,36 +1812,96 @@ const draw = () => {
 		ctx.textAlign = "center";
 		ctx.fillStyle = `rgba(255, 80, 80, ${alpha})`;
 		ctx.font = "24px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Işığın Söndü", canvas.width / 2, popupY + 60);
+		ctx.fillText("Işığın Söndü", viewportWidth / 2, popupY + 45);
 
 		ctx.fillStyle = `rgba(200, 200, 200, ${0.7 * alpha})`;
 		ctx.font = "13px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText(`Son Skor: ${score}`, canvas.width / 2, popupY + 90);
+		ctx.fillText(`Son Skor: ${score}`, viewportWidth / 2, popupY + 70);
 
-		const btnWidth = 180;
+		const btnWidth = 200;
 		const btnHeight = 40;
-		const btnX = canvas.width / 2 - btnWidth / 2;
-		const btnY = popupY + popupHeight - 60;
+		const btnGap = 16;
+		const startBtnY = popupY + 100;
 
-		const gradient = ctx.createLinearGradient(btnX, btnY, btnX, btnY + btnHeight);
+		// 1. Restart Button
+		const restartBtnY = startBtnY;
+		const gradient = ctx.createLinearGradient(
+			viewportWidth / 2,
+			restartBtnY,
+			viewportWidth / 2,
+			restartBtnY + btnHeight
+		);
 		gradient.addColorStop(0, `rgba(80, 150, 255, ${0.9 * alpha})`);
 		gradient.addColorStop(1, `rgba(50, 100, 200, ${0.9 * alpha})`);
 		ctx.fillStyle = gradient;
 		ctx.beginPath();
-		ctx.roundRect(btnX, btnY, btnWidth, btnHeight, 8);
+		ctx.roundRect(
+			viewportWidth / 2 - btnWidth / 2,
+			restartBtnY,
+			btnWidth,
+			btnHeight,
+			8
+		);
 		ctx.fill();
 
 		ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
 		ctx.font = "14px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Yeniden Başla", canvas.width / 2, btnY + 26);
+		ctx.fillText(
+			"Yeniden Başla",
+			viewportWidth / 2,
+			restartBtnY + btnHeight * 0.65
+		);
+
+		// 2. Scoreboard Button
+		const scoreBtnY = startBtnY + btnHeight + btnGap;
+		ctx.strokeStyle = `rgba(80, 150, 255, ${0.8 * alpha})`;
+		ctx.lineWidth = 1.5;
+		ctx.beginPath();
+		ctx.roundRect(
+			viewportWidth / 2 - btnWidth / 2,
+			scoreBtnY,
+			btnWidth,
+			btnHeight,
+			8
+		);
+		ctx.stroke();
+
+		ctx.fillStyle = `rgba(200, 220, 255, ${alpha})`;
+		ctx.fillText(
+			"Skor Tablosu",
+			viewportWidth / 2,
+			scoreBtnY + btnHeight * 0.65
+		);
+
+		// 3. Main Menu Button
+		const menuBtnY = scoreBtnY + btnHeight + btnGap;
+		ctx.strokeStyle = `rgba(150, 160, 180, ${0.6 * alpha})`;
+		ctx.lineWidth = 1.5;
+		ctx.beginPath();
+		ctx.roundRect(
+			viewportWidth / 2 - btnWidth / 2,
+			menuBtnY,
+			btnWidth,
+			btnHeight,
+			8
+		);
+		ctx.stroke();
+
+		ctx.fillStyle = `rgba(180, 190, 200, ${alpha})`;
+		ctx.fillText(
+			"Ana Sayfa",
+			viewportWidth / 2,
+			menuBtnY + btnHeight * 0.65
+		);
+
 		ctx.restore();
 	}
 
 	if (showConfirmHome) {
-		const { popup, yes, no } = getConfirmHomeButtons();
+		const { popup, continueGame, home, restart, scoreboard } = getConfirmHomeButtons();
 		ctx.save();
 		ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 		ctx.restore();
 
 		ctx.save();
@@ -1374,38 +1919,61 @@ const draw = () => {
 		ctx.textAlign = "center";
 		ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
 		ctx.font = "20px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Ana sayfaya dönmek", canvas.width / 2, popup.y + 70);
-		ctx.fillText("istiyor musun?", canvas.width / 2, popup.y + 95);
+		ctx.fillText("⏸ Oyun Duraklatıldı", viewportWidth / 2, popup.y + 52);
 
-		ctx.fillStyle = "rgba(80, 150, 255, 0.95)";
+		const continueGradient = ctx.createLinearGradient(continueGame.x, continueGame.y, continueGame.x, continueGame.y + continueGame.height);
+		continueGradient.addColorStop(0, "rgba(85, 200, 132, 0.97)");
+		continueGradient.addColorStop(1, "rgba(56, 154, 97, 0.95)");
+		ctx.fillStyle = continueGradient;
 		ctx.beginPath();
-		ctx.roundRect(yes.x, yes.y, yes.width, yes.height, 8);
+		ctx.roundRect(continueGame.x, continueGame.y, continueGame.width, continueGame.height, 8);
 		ctx.fill();
 		ctx.fillStyle = "rgba(255, 255, 255, 1)";
 		ctx.font = "14px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Evet", yes.x + yes.width / 2, yes.y + 26);
+		ctx.fillText("Devam Et", continueGame.x + continueGame.width / 2, continueGame.y + continueGame.height * 0.64);
+
+		const homeGradient = ctx.createLinearGradient(home.x, home.y, home.x, home.y + home.height);
+		homeGradient.addColorStop(0, "rgba(80, 150, 255, 0.95)");
+		homeGradient.addColorStop(1, "rgba(50, 100, 200, 0.95)");
+		ctx.fillStyle = homeGradient;
+		ctx.beginPath();
+		ctx.roundRect(home.x, home.y, home.width, home.height, 8);
+		ctx.fill();
+		ctx.fillStyle = "rgba(255, 255, 255, 1)";
+		ctx.font = "14px 'Helvetica Neue', Arial, sans-serif";
+		ctx.fillText("Ana Sayfaya Dön", home.x + home.width / 2, home.y + home.height * 0.64);
+
+		const restartGradient = ctx.createLinearGradient(restart.x, restart.y, restart.x, restart.y + restart.height);
+		restartGradient.addColorStop(0, "rgba(255, 216, 104, 0.97)");
+		restartGradient.addColorStop(1, "rgba(235, 176, 52, 0.95)");
+		ctx.fillStyle = restartGradient;
+		ctx.beginPath();
+		ctx.roundRect(restart.x, restart.y, restart.width, restart.height, 8);
+		ctx.fill();
+		ctx.fillStyle = "rgba(42, 33, 8, 0.96)";
+		ctx.fillText("Yeniden Başla", restart.x + restart.width / 2, restart.y + restart.height * 0.64);
 
 		ctx.strokeStyle = "rgba(120, 200, 255, 0.8)";
 		ctx.lineWidth = 2;
 		ctx.beginPath();
-		ctx.roundRect(no.x, no.y, no.width, no.height, 8);
+		ctx.roundRect(scoreboard.x, scoreboard.y, scoreboard.width, scoreboard.height, 8);
 		ctx.stroke();
 		ctx.fillStyle = "rgba(200, 220, 255, 1)";
-		ctx.fillText("Vazgeç", no.x + no.width / 2, no.y + 26);
+		ctx.fillText("Skor Tablosu", scoreboard.x + scoreboard.width / 2, scoreboard.y + scoreboard.height * 0.64);
 		ctx.restore();
 	}
 
 	if (!isGameStarted) {
 		ctx.save();
 		ctx.fillStyle = "rgba(0, 0, 0, 0.8)";
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 		ctx.restore();
 
 		ctx.save();
-		const popupWidth = Math.min(340, canvas.width - 40);
+		const popupWidth = Math.min(340, viewportWidth - 40);
 		const popupHeight = 220;
-		const popupX = canvas.width / 2 - popupWidth / 2;
-		const popupY = canvas.height / 2 - popupHeight / 2;
+		const popupX = viewportWidth / 2 - popupWidth / 2;
+		const popupY = viewportHeight / 2 - popupHeight / 2;
 
 		ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
 		ctx.shadowBlur = 40;
@@ -1422,19 +1990,19 @@ const draw = () => {
 		ctx.textAlign = "center";
 		ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
 		ctx.font = "28px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("✨ Space Travel", canvas.width / 2, popupY + 60);
+		ctx.fillText("✨ Space Travel", viewportWidth / 2, popupY + 60);
 
 		ctx.fillStyle = "rgba(200, 200, 200, 0.8)";
 		ctx.font = "14px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText(`İlk hedef: ${stageTargets[0]} Işık Yılı`, canvas.width / 2, popupY + 100);
+		ctx.fillText("Başlangıç: Level 1", viewportWidth / 2, popupY + 100);
 
 		ctx.fillStyle = "rgba(180, 180, 180, 0.6)";
 		ctx.font = "12px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Yıldız tozlarını topla, gök taşlarından kaç", canvas.width / 2, popupY + 120);
+		ctx.fillText("Yıldız tozlarını topla, gök taşlarından kaç", viewportWidth / 2, popupY + 120);
 
 		const btnWidth = 200;
 		const btnHeight = 44;
-		const btnX = canvas.width / 2 - btnWidth / 2;
+		const btnX = viewportWidth / 2 - btnWidth / 2;
 		const btnY = popupY + popupHeight - 65;
 
 		const gradient = ctx.createLinearGradient(btnX, btnY, btnX, btnY + btnHeight);
@@ -1447,71 +2015,76 @@ const draw = () => {
 
 		ctx.fillStyle = "rgba(255, 255, 255, 1)";
 		ctx.font = "16px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Başla", canvas.width / 2, btnY + 28);
+		ctx.fillText("Başla", viewportWidth / 2, btnY + 28);
 		ctx.restore();
 	}
 
 	if (showLandingPage) {
 		ctx.save();
-		const overlay = ctx.createLinearGradient(0, 0, 0, canvas.height);
+		const overlay = ctx.createLinearGradient(0, 0, 0, viewportHeight);
 		overlay.addColorStop(0, "rgba(0, 0, 0, 0.25)");
 		overlay.addColorStop(0.5, "rgba(0, 0, 0, 0.35)");
 		overlay.addColorStop(1, "rgba(0, 0, 0, 0.55)");
 		ctx.fillStyle = overlay;
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 		ctx.globalCompositeOperation = "lighter";
 		const glow1 = ctx.createRadialGradient(
-			canvas.width * 0.2,
-			canvas.height * 0.2,
+			viewportWidth * 0.2,
+			viewportHeight * 0.2,
 			0,
-			canvas.width * 0.2,
-			canvas.height * 0.2,
-			Math.max(canvas.width, canvas.height) * 0.35
+			viewportWidth * 0.2,
+			viewportHeight * 0.2,
+			Math.max(viewportWidth, viewportHeight) * 0.35
 		);
 		glow1.addColorStop(0, "rgba(255, 220, 140, 0.35)");
 		glow1.addColorStop(1, "rgba(255, 220, 140, 0)");
 		ctx.fillStyle = glow1;
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 
 		const glow2 = ctx.createRadialGradient(
-			canvas.width * 0.85,
-			canvas.height * 0.25,
+			viewportWidth * 0.85,
+			viewportHeight * 0.25,
 			0,
-			canvas.width * 0.85,
-			canvas.height * 0.25,
-			Math.max(canvas.width, canvas.height) * 0.3
+			viewportWidth * 0.85,
+			viewportHeight * 0.25,
+			Math.max(viewportWidth, viewportHeight) * 0.3
 		);
 		glow2.addColorStop(0, "rgba(140, 200, 255, 0.28)");
 		glow2.addColorStop(1, "rgba(140, 200, 255, 0)");
 		ctx.fillStyle = glow2;
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 
 		const glow3 = ctx.createRadialGradient(
-			canvas.width * 0.5,
-			canvas.height * 0.8,
+			viewportWidth * 0.5,
+			viewportHeight * 0.8,
 			0,
-			canvas.width * 0.5,
-			canvas.height * 0.8,
-			Math.max(canvas.width, canvas.height) * 0.25
+			viewportWidth * 0.5,
+			viewportHeight * 0.8,
+			Math.max(viewportWidth, viewportHeight) * 0.25
 		);
 		glow3.addColorStop(0, "rgba(255, 160, 220, 0.22)");
 		glow3.addColorStop(1, "rgba(255, 160, 220, 0)");
 		ctx.fillStyle = glow3;
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 		ctx.restore();
 
 		ctx.save();
-		const popupWidth = Math.min(380, canvas.width - 40);
-		const popupHeight = 320;
-		const popupX = canvas.width / 2 - popupWidth / 2;
-		const popupY = canvas.height / 2 - popupHeight / 2;
+		const layout = getLandingLayout();
+		const { popup, input, playButton, scoreButton } = layout;
+		const canStartFromLanding = hasValidTempUsername();
+		const hasExistingName = Boolean(sanitizeName(tempUsername));
+		const titleSize = Math.round(clamp(32 * popup.scale, 24, 34));
+		const subtitleSize = Math.round(clamp(13 * popup.scale, 12, 14));
+		const labelSize = Math.round(clamp(12 * popup.scale, 11, 13));
+		const inputFontSize = Math.round(clamp(15 * popup.scale, 14, 16));
+		const buttonFontSize = Math.round(clamp(14 * popup.scale, 12, 15));
 
 		ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
 		ctx.shadowBlur = 40;
 		ctx.shadowOffsetY = 15;
 		ctx.fillStyle = "rgba(20, 25, 35, 0.95)";
 		ctx.beginPath();
-		ctx.roundRect(popupX, popupY, popupWidth, popupHeight, 12);
+		ctx.roundRect(popup.x, popup.y, popup.width, popup.height, 12);
 		ctx.fill();
 
 		ctx.shadowColor = "transparent";
@@ -1520,29 +2093,24 @@ const draw = () => {
 
 		ctx.textAlign = "center";
 		ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
-		ctx.font = "32px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("✨ Space Travel", canvas.width / 2, popupY + 60);
+		ctx.font = `${titleSize}px 'Helvetica Neue', Arial, sans-serif`;
+		ctx.fillText("✨ Space Travel", viewportWidth / 2, popup.y + Math.max(48, 60 * popup.scale));
 
 		ctx.fillStyle = "rgba(200, 200, 200, 0.7)";
-		ctx.font = "13px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Uzayda parıldayan bir yolculuğa hazır mısın?", canvas.width / 2, popupY + 95);
+		ctx.font = `${subtitleSize}px 'Helvetica Neue', Arial, sans-serif`;
+		ctx.fillText("Uzayda parıldayan bir yolculuğa hazır mısın?", viewportWidth / 2, popup.y + Math.max(80, 95 * popup.scale));
 
 		ctx.textAlign = "left";
 		ctx.fillStyle = "rgba(180, 180, 180, 0.8)";
-		ctx.font = "12px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Kullanıcı Adı:", popupX + 30, popupY + 135);
+		ctx.font = `${labelSize}px 'Helvetica Neue', Arial, sans-serif`;
+		ctx.fillText("Kullanıcı Adı:", input.x, input.y - Math.max(8, 10 * popup.scale));
 
-		const inputWidth = popupWidth - 60;
-		const inputHeight = 40;
-		const inputX = popupX + 30;
-		const inputY = popupY + 145;
-
-		ctx.fillStyle = "rgba(40, 45, 60, 0.8)";
+		ctx.fillStyle = hasExistingName ? "rgba(35, 42, 58, 0.95)" : "rgba(40, 45, 60, 0.82)";
 		ctx.beginPath();
-		ctx.roundRect(inputX, inputY, inputWidth, inputHeight, 8);
+		ctx.roundRect(input.x, input.y, input.width, input.height, 8);
 		ctx.fill();
 
-		ctx.strokeStyle = "rgba(80, 150, 255, 0.5)";
+		ctx.strokeStyle = hasExistingName ? "rgba(122, 208, 255, 0.95)" : "rgba(80, 150, 255, 0.5)";
 		ctx.lineWidth = 2;
 		ctx.stroke();
 
@@ -1551,42 +2119,52 @@ const draw = () => {
 		const placeholderText = shouldShowCanvasInputText ? "Adını gir..." : "";
 
 		ctx.textAlign = "left";
-		ctx.fillStyle = displayName ? "rgba(255, 255, 255, 0.9)" : "rgba(150, 150, 150, 0.5)";
-		ctx.font = "15px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText(displayName || placeholderText, inputX + 15, inputY + 26);
+		ctx.fillStyle = displayName
+			? (hasExistingName ? "rgba(240, 246, 255, 0.98)" : "rgba(255, 255, 255, 0.9)")
+			: "rgba(160, 172, 196, 0.75)";
+		ctx.font = `${inputFontSize}px 'Helvetica Neue', Arial, sans-serif`;
+		ctx.fillText(displayName || placeholderText, input.x + 12, input.y + input.height * 0.65);
 
-		const btn1Width = 150;
-		const btn1Height = 42;
-		const btn1X = canvas.width / 2 - btn1Width - 10;
-		const btn1Y = popupY + popupHeight - 75;
+		if (hasExistingName && !isTypingName) {
+			ctx.textAlign = "right";
+			ctx.fillStyle = "rgba(170, 220, 255, 0.9)";
+			ctx.font = `${Math.round(clamp(11 * popup.scale, 10, 12))}px 'Helvetica Neue', Arial, sans-serif`;
+			ctx.fillText("Düzenlemek için dokun", input.x + input.width - 10, input.y + input.height * 0.65);
+		}
 
-		const gradient1 = ctx.createLinearGradient(btn1X, btn1Y, btn1X, btn1Y + btn1Height);
-		gradient1.addColorStop(0, "rgba(80, 150, 255, 0.95)");
-		gradient1.addColorStop(1, "rgba(50, 100, 200, 0.95)");
-		ctx.fillStyle = gradient1;
+		if (landingWarning) {
+			ctx.textAlign = "left";
+			ctx.fillStyle = "rgba(255, 120, 120, 0.95)";
+			ctx.font = `${Math.round(clamp(12 * popup.scale, 11, 13))}px 'Helvetica Neue', Arial, sans-serif`;
+			ctx.fillText(landingWarning, input.x, input.y + input.height + Math.max(16, 18 * popup.scale));
+		}
+
+		if (canStartFromLanding) {
+			const gradient1 = ctx.createLinearGradient(playButton.x, playButton.y, playButton.x, playButton.y + playButton.height);
+			gradient1.addColorStop(0, "rgba(80, 150, 255, 0.95)");
+			gradient1.addColorStop(1, "rgba(50, 100, 200, 0.95)");
+			ctx.fillStyle = gradient1;
+		} else {
+			ctx.fillStyle = "rgba(50, 60, 80, 0.45)";
+		}
 		ctx.beginPath();
-		ctx.roundRect(btn1X, btn1Y, btn1Width, btn1Height, 8);
+		ctx.roundRect(playButton.x, playButton.y, playButton.width, playButton.height, 8);
 		ctx.fill();
 
 		ctx.textAlign = "center";
 		ctx.fillStyle = "rgba(255, 255, 255, 1)";
-		ctx.font = "14px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Oyuna Başla", btn1X + btn1Width / 2, btn1Y + 27);
-
-		const btn2Width = 150;
-		const btn2Height = 42;
-		const btn2X = canvas.width / 2 + 10;
-		const btn2Y = popupY + popupHeight - 75;
+		ctx.font = `${buttonFontSize}px 'Helvetica Neue', Arial, sans-serif`;
+		ctx.fillText("Oyuna Başla", playButton.x + playButton.width / 2, playButton.y + playButton.height * 0.64);
 
 		ctx.strokeStyle = "rgba(80, 150, 255, 0.8)";
 		ctx.lineWidth = 2;
 		ctx.beginPath();
-		ctx.roundRect(btn2X, btn2Y, btn2Width, btn2Height, 8);
+		ctx.roundRect(scoreButton.x, scoreButton.y, scoreButton.width, scoreButton.height, 8);
 		ctx.stroke();
 
 		ctx.fillStyle = "rgba(150, 180, 255, 1)";
-		ctx.font = "14px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Skor Tablosu", btn2X + btn2Width / 2, btn2Y + 27);
+		ctx.font = `${buttonFontSize}px 'Helvetica Neue', Arial, sans-serif`;
+		ctx.fillText("Skor Tablosu", scoreButton.x + scoreButton.width / 2, scoreButton.y + scoreButton.height * 0.64);
 
 		ctx.restore();
 	}
@@ -1594,21 +2172,23 @@ const draw = () => {
 	if (showScoreboard) {
 		ctx.save();
 		ctx.fillStyle = "rgba(0, 0, 0, 0.85)";
-		ctx.fillRect(0, 0, canvas.width, canvas.height);
+		ctx.fillRect(0, 0, viewportWidth, viewportHeight);
 		ctx.restore();
 
 		ctx.save();
-		const popupWidth = Math.min(380, canvas.width - 40);
-		const popupHeight = 400;
-		const popupX = canvas.width / 2 - popupWidth / 2;
-		const popupY = canvas.height / 2 - popupHeight / 2;
+		const layout = getScoreboardLayout();
+		const { popup, button } = layout;
+		const titleSize = Math.round(clamp(26 * popup.scale, 22, 28));
+		const rankSize = Math.round(clamp(18 * popup.scale, 15, 19));
+		const rowTextSize = Math.round(clamp(15 * popup.scale, 13, 16));
+		const buttonTextSize = Math.round(clamp(14 * popup.scale, 12, 15));
 
 		ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
 		ctx.shadowBlur = 40;
 		ctx.shadowOffsetY = 15;
 		ctx.fillStyle = "rgba(20, 25, 35, 0.95)";
 		ctx.beginPath();
-		ctx.roundRect(popupX, popupY, popupWidth, popupHeight, 12);
+		ctx.roundRect(popup.x, popup.y, popup.width, popup.height, 12);
 		ctx.fill();
 
 		ctx.shadowColor = "transparent";
@@ -1617,51 +2197,48 @@ const draw = () => {
 
 		ctx.textAlign = "center";
 		ctx.fillStyle = "rgba(255, 200, 100, 0.95)";
-		ctx.font = "26px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("🏆 En İyi Skorlar", canvas.width / 2, popupY + 50);
+		ctx.font = `${titleSize}px 'Helvetica Neue', Arial, sans-serif`;
+		ctx.fillText("🏆 En İyi Skorlar", viewportWidth / 2, popup.y + Math.max(40, 50 * popup.scale));
 
 		loadHighScores();
-		const startY = popupY + 90;
+		const startY = popup.y + Math.max(78, 90 * popup.scale);
+		const rowHeight = Math.max(36, 40 * popup.scale);
+		const rowStep = Math.max(42, 50 * popup.scale);
 		for (let i = 0; i < Math.min(5, highScores.length); i++) {
 			const scoreData = highScores[i];
-			const itemY = startY + i * 50;
-			
+			const itemY = startY + i * rowStep;
+
 			ctx.fillStyle = "rgba(40, 45, 60, 0.6)";
 			ctx.beginPath();
-			ctx.roundRect(popupX + 20, itemY, popupWidth - 40, 40, 6);
+			ctx.roundRect(popup.x + 20, itemY, popup.width - 40, rowHeight, 6);
 			ctx.fill();
 
 			ctx.textAlign = "left";
 			ctx.fillStyle = "rgba(255, 200, 100, 0.9)";
-			ctx.font = "18px 'Helvetica Neue', Arial, sans-serif";
-			ctx.fillText(`${i + 1}.`, popupX + 35, itemY + 26);
+			ctx.font = `${rankSize}px 'Helvetica Neue', Arial, sans-serif`;
+			ctx.fillText(`${i + 1}.`, popup.x + 35, itemY + rowHeight * 0.65);
 
 			ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
-			ctx.font = "15px 'Helvetica Neue', Arial, sans-serif";
-			ctx.fillText(scoreData.name, popupX + 60, itemY + 26);
+			ctx.font = `${rowTextSize}px 'Helvetica Neue', Arial, sans-serif`;
+			ctx.fillText(scoreData.name, popup.x + 60, itemY + rowHeight * 0.65);
 
 			ctx.textAlign = "right";
 			ctx.fillStyle = "rgba(150, 200, 255, 0.9)";
-			ctx.fillText(`${scoreData.score} LY`, popupX + popupWidth - 35, itemY + 26);
+			ctx.fillText(`Lv ${scoreData.level} • ${scoreData.score}`, popup.x + popup.width - 35, itemY + rowHeight * 0.65);
 		}
 
-		const btnWidth = 180;
-		const btnHeight = 42;
-		const btnX = canvas.width / 2 - btnWidth / 2;
-		const btnY = popupY + popupHeight - 60;
-
-		const gradient = ctx.createLinearGradient(btnX, btnY, btnX, btnY + btnHeight);
+		const gradient = ctx.createLinearGradient(button.x, button.y, button.x, button.y + button.height);
 		gradient.addColorStop(0, "rgba(80, 150, 255, 0.95)");
 		gradient.addColorStop(1, "rgba(50, 100, 200, 0.95)");
 		ctx.fillStyle = gradient;
 		ctx.beginPath();
-		ctx.roundRect(btnX, btnY, btnWidth, btnHeight, 8);
+		ctx.roundRect(button.x, button.y, button.width, button.height, 8);
 		ctx.fill();
 
 		ctx.textAlign = "center";
 		ctx.fillStyle = "rgba(255, 255, 255, 1)";
-		ctx.font = "14px 'Helvetica Neue', Arial, sans-serif";
-		ctx.fillText("Geri Dön", canvas.width / 2, btnY + 27);
+		ctx.font = `${buttonTextSize}px 'Helvetica Neue', Arial, sans-serif`;
+		ctx.fillText("Geri Dön", viewportWidth / 2, button.y + button.height * 0.64);
 
 		ctx.restore();
 	}
@@ -1768,13 +2345,14 @@ const startAmbience = () => {
 };
 
 const resetGame = () => {
-	if (username && score > 0) {
-		saveScore(username, score);
+	if (username) {
+		const reachedLevel = Math.max(1, currentStage + 1);
+		void syncPlayerProfile({ name: username, score, level: reachedLevel });
 	}
 	player.radius = 10;
 	player.velocity = 0;
-	player.x = canvas.width * 0.3;
-	player.y = canvas.height * 0.5;
+	player.x = viewportWidth * 0.3;
+	player.y = viewportHeight * 0.5;
 	trail.length = 0;
 	particles.length = 0;
 	planets.length = 0;
@@ -1792,37 +2370,31 @@ const resetGame = () => {
 	stageCompleteStart = 0;
 	isGameStarted = false;
 	showConfirmHome = false;
+	shakeTime = 0;
+	shakeIntensity = 0;
+	shakePhase = 0;
+	shakeOffsetX = 0;
+	shakeOffsetY = 0;
 };
 
 const startGame = () => {
+	const cleanName = sanitizeName(username);
+	if (!cleanName) {
+		showLandingPage = true;
+		landingWarning = "Oyuna başlamak için kullanıcı adı gerekli.";
+		return false;
+	}
+	username = cleanName;
+	tempUsername = cleanName;
+	landingWarning = "";
+	void syncPlayerProfile({ name: username, score, level: Math.max(1, currentStage + 1) });
 	isGameStarted = true;
-};
-
-const loadHighScores = () => {
-	try {
-		const saved = localStorage.getItem('lightJourneyScores');
-		highScores = saved ? JSON.parse(saved) : [];
-		highScores.sort((a, b) => b.score - a.score);
-	} catch (e) {
-		highScores = [];
-	}
-};
-
-const saveScore = (name, scoreValue) => {
-	try {
-		loadHighScores();
-		highScores.push({ name, score: scoreValue, date: Date.now() });
-		highScores.sort((a, b) => b.score - a.score);
-		highScores = highScores.slice(0, 10);
-		localStorage.setItem('lightJourneyScores', JSON.stringify(highScores));
-	} catch (e) {
-		console.error('Skor kaydedilemedi');
-	}
+	return true;
 };
 
 const checkStageComplete = () => {
-	const target = stageTargets[currentStage];
-	if (target && score >= target && !isStageComplete) {
+	const target = getStageTarget(currentStage);
+	if (score >= target && !isStageComplete) {
 		isStageComplete = true;
 		stageCompleteStart = Date.now();
 	}
@@ -1832,15 +2404,13 @@ const advanceStage = () => {
 	if (!isStageComplete) {
 		return;
 	}
-	if (currentStage < stageTargets.length - 1) {
-		currentStage += 1;
-		score = 0;
-		isStageComplete = false;
-		stageCompleteStart = 0;
-	} else {
-		isStageComplete = false;
-		stageCompleteStart = 0;
+	currentStage += 1;
+	if (username) {
+		void syncPlayerProfile({ name: username, score, level: currentStage + 1 });
 	}
+	score = 0;
+	isStageComplete = false;
+	stageCompleteStart = 0;
 };
 
 const handleRestartPress = (event) => {
@@ -1849,11 +2419,64 @@ const handleRestartPress = (event) => {
 	}
 	event.preventDefault();
 	initAudio();
-	resetGame();
+
+	const clientX = getPointerX(event);
+	const clientY = getPointerY(event);
+	const { x, y } = getCanvasCoords(clientX, clientY);
+
+	// Re-calculate button positions (must match draw logic)
+	const popupHeight = 280;
+	const popupY = viewportHeight / 2 - popupHeight / 2;
+	const btnWidth = 200;
+	const btnHeight = 40;
+	const btnGap = 16;
+	const startBtnY = popupY + 100;
+	const btnX = viewportWidth / 2 - btnWidth / 2;
+
+	// 1. Restart Button
+	if (
+		x >= btnX &&
+		x <= btnX + btnWidth &&
+		y >= startBtnY &&
+		y <= startBtnY + btnHeight
+	) {
+		resetGame();
+		return;
+	}
+
+	// 2. Scoreboard Button
+	const scoreBtnY = startBtnY + btnHeight + btnGap;
+	if (
+		x >= btnX &&
+		x <= btnX + btnWidth &&
+		y >= scoreBtnY &&
+		y <= scoreBtnY + btnHeight
+	) {
+		isGameOver = false;
+		showScoreboard = true;
+		void loadHighScores(true);
+		return;
+	}
+
+	// 3. Main Menu Button
+	const menuBtnY = scoreBtnY + btnHeight + btnGap;
+	if (
+		x >= btnX &&
+		x <= btnX + btnWidth &&
+		y >= menuBtnY &&
+		y <= menuBtnY + btnHeight
+	) {
+		// Reset game state but show landing page
+		resetGame();
+		showLandingPage = true;
+		isGameStarted = false;
+		return;
+	}
 };
 
 canvas.addEventListener("mousedown", handleRestartPress);
 canvas.addEventListener("touchstart", handleRestartPress, { passive: false });
 
 resizeCanvas();
+void initFirebase();
 loop();

@@ -1,3 +1,10 @@
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+}
+
 html, body {
   margin: 0;
   padding: 0;
@@ -6,6 +13,13 @@ html, body {
   overflow: hidden;
   background-color: #000;
   overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-text-size-adjust: 100%;
+  -webkit-touch-callout: none;
+  touch-action: none;
+  position: fixed;
+  inset: 0;
 }
 
 #gameCanvas {
@@ -27,7 +41,8 @@ html, body {
   color: #fff;
   border: none;
   outline: none;
-  font: 15px "Helvetica Neue", Arial, sans-serif;
+  font: 16px "Helvetica Neue", Arial, sans-serif;
   padding: 10px 12px;
   box-sizing: border-box;
+  border-radius: 8px;
 }
