@@ -82,6 +82,10 @@ let isTypingName = false;
 let showConfirmHome = false;
 let landingWarning = "";
 let scoreboardSource = "landing";
+let leaderboardScrollOffset = 0;
+let leaderboardMaxScroll = 0;
+let leaderboardDragActive = false;
+let leaderboardDragLastY = 0;
 
 const trail = [];
 const maxTrailLength = 40;
@@ -356,6 +360,34 @@ const getScoreboardLayout = () => {
 	};
 };
 
+const getScoreboardListRect = (layout = getScoreboardLayout()) => {
+	const { popup, button } = layout;
+	const horizontalPadding = clamp(16 * popup.scale, 12, 20);
+	const topPadding = clamp(66 * popup.scale, 56, 76);
+	const bottomGap = clamp(14 * popup.scale, 10, 18);
+	const y = popup.y + topPadding;
+	const height = Math.max(100, button.y - bottomGap - y);
+	return {
+		x: popup.x + horizontalPadding,
+		y,
+		width: popup.width - horizontalPadding * 2,
+		height,
+		rowHeight: Math.max(36, 40 * popup.scale),
+		rowGap: Math.max(8, 10 * popup.scale),
+	};
+};
+
+const clampLeaderboardScroll = () => {
+	leaderboardScrollOffset = clamp(leaderboardScrollOffset, 0, leaderboardMaxScroll);
+};
+
+const isPointInsideRect = (x, y, rect) => (
+	x >= rect.x &&
+	x <= rect.x + rect.width &&
+	y >= rect.y &&
+	y <= rect.y + rect.height
+);
+
 const loadHighScores = async (force = false) => {
 	if (!firebaseReady || !firebaseDb) {
 		return;
@@ -369,7 +401,6 @@ const loadHighScores = async (force = false) => {
 		const snapshot = await firebaseDb
 			.collection(PLAYER_COLLECTION)
 			.orderBy("bestScore", "desc")
-			.limit(10)
 			.get();
 		highScores = snapshot.docs.map((doc) => {
 			const data = doc.data() || {};
@@ -649,6 +680,12 @@ const handlePressStart = (event) => {
 		return;
 	}
 	if (showScoreboard) {
+		const { x, y } = getCanvasCoords(getPointerX(event), getPointerY(event));
+		const listRect = getScoreboardListRect();
+		if (isPointInsideRect(x, y, listRect)) {
+			leaderboardDragActive = true;
+			leaderboardDragLastY = y;
+		}
 		return;
 	}
 	const clientX = getPointerX(event);
@@ -699,6 +736,7 @@ const handlePressStart = (event) => {
 			showConfirmHome = false;
 			showScoreboard = true;
 			scoreboardSource = "pause";
+			leaderboardScrollOffset = 0;
 			void loadHighScores(true);
 			return;
 		}
@@ -737,9 +775,19 @@ const handlePressStart = (event) => {
 const handlePressEnd = (event) => {
 	event.preventDefault();
 	isPressing = false;
+	leaderboardDragActive = false;
 };
 
 const handlePointerMove = (event) => {
+	if (showScoreboard && leaderboardDragActive) {
+		event.preventDefault();
+		const pointerPos = getCanvasCoords(getPointerX(event), getPointerY(event));
+		const deltaY = pointerPos.y - leaderboardDragLastY;
+		leaderboardDragLastY = pointerPos.y;
+		leaderboardScrollOffset -= deltaY;
+		clampLeaderboardScroll();
+		return;
+	}
 	if (!isPressing) {
 		return;
 	}
@@ -838,6 +886,19 @@ canvas.addEventListener("touchstart", handlePressStart, { passive: false });
 canvas.addEventListener("touchend", handlePressEnd, { passive: false });
 canvas.addEventListener("touchcancel", handlePressEnd, { passive: false });
 canvas.addEventListener("touchmove", handlePointerMove, { passive: false });
+canvas.addEventListener("wheel", (event) => {
+	if (!showScoreboard) {
+		return;
+	}
+	const { x, y } = getCanvasCoords(event.clientX, event.clientY);
+	const listRect = getScoreboardListRect();
+	if (!isPointInsideRect(x, y, listRect)) {
+		return;
+	}
+	event.preventDefault();
+	leaderboardScrollOffset += event.deltaY;
+	clampLeaderboardScroll();
+}, { passive: false });
 
 window.addEventListener("keydown", (e) => {
 	if (showLandingPage) {
@@ -951,6 +1012,7 @@ const handleLandingInteraction = (clientX, clientY) => {
 			showLandingPage = false;
 			showScoreboard = true;
 			scoreboardSource = "landing";
+			leaderboardScrollOffset = 0;
 			void loadHighScores(true);
 			closeUsernameEditor();
 		}
@@ -959,6 +1021,7 @@ const handleLandingInteraction = (clientX, clientY) => {
 
 		if (x >= button.x && x <= button.x + button.width && y >= button.y && y <= button.y + button.height) {
 			showScoreboard = false;
+			leaderboardDragActive = false;
 			closeUsernameEditor();
 			if (scoreboardSource === "pause") {
 				showConfirmHome = true;
@@ -2178,10 +2241,18 @@ const draw = () => {
 		ctx.save();
 		const layout = getScoreboardLayout();
 		const { popup, button } = layout;
+		const listRect = getScoreboardListRect(layout);
 		const titleSize = Math.round(clamp(26 * popup.scale, 22, 28));
 		const rankSize = Math.round(clamp(18 * popup.scale, 15, 19));
 		const rowTextSize = Math.round(clamp(15 * popup.scale, 13, 16));
 		const buttonTextSize = Math.round(clamp(14 * popup.scale, 12, 15));
+		const topFiveRowStyles = [
+			{ bg: "rgba(115, 90, 30, 0.48)", border: "rgba(255, 210, 120, 0.78)", rank: "rgba(255, 215, 120, 0.98)" },
+			{ bg: "rgba(70, 82, 102, 0.5)", border: "rgba(198, 212, 232, 0.74)", rank: "rgba(222, 232, 248, 0.97)" },
+			{ bg: "rgba(95, 64, 44, 0.48)", border: "rgba(218, 170, 128, 0.74)", rank: "rgba(242, 194, 146, 0.97)" },
+			{ bg: "rgba(44, 82, 92, 0.46)", border: "rgba(132, 214, 232, 0.72)", rank: "rgba(162, 232, 248, 0.95)" },
+			{ bg: "rgba(58, 66, 108, 0.48)", border: "rgba(168, 186, 255, 0.72)", rank: "rgba(192, 210, 255, 0.95)" },
+		];
 
 		ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
 		ctx.shadowBlur = 40;
@@ -2198,33 +2269,73 @@ const draw = () => {
 		ctx.textAlign = "center";
 		ctx.fillStyle = "rgba(255, 200, 100, 0.95)";
 		ctx.font = `${titleSize}px 'Helvetica Neue', Arial, sans-serif`;
-		ctx.fillText("🏆 En İyi Skorlar", viewportWidth / 2, popup.y + Math.max(40, 50 * popup.scale));
+		ctx.fillText("🏆 Tüm Skorlar", viewportWidth / 2, popup.y + Math.max(40, 50 * popup.scale));
 
 		loadHighScores();
-		const startY = popup.y + Math.max(78, 90 * popup.scale);
-		const rowHeight = Math.max(36, 40 * popup.scale);
-		const rowStep = Math.max(42, 50 * popup.scale);
-		for (let i = 0; i < Math.min(5, highScores.length); i++) {
-			const scoreData = highScores[i];
-			const itemY = startY + i * rowStep;
+		const rowHeight = listRect.rowHeight;
+		const rowStep = listRect.rowHeight + listRect.rowGap;
+		const totalHeight = Math.max(0, (highScores.length * rowStep) - listRect.rowGap);
+		leaderboardMaxScroll = Math.max(0, totalHeight - listRect.height);
+		clampLeaderboardScroll();
 
-			ctx.fillStyle = "rgba(40, 45, 60, 0.6)";
+		ctx.save();
+		ctx.beginPath();
+		ctx.rect(listRect.x, listRect.y, listRect.width, listRect.height);
+		ctx.clip();
+		for (let i = 0; i < highScores.length; i++) {
+			const scoreData = highScores[i];
+			const itemY = listRect.y + (i * rowStep) - leaderboardScrollOffset;
+			if (itemY + rowHeight < listRect.y || itemY > listRect.y + listRect.height) {
+				continue;
+			}
+
+			const rowStyle = topFiveRowStyles[i] || {
+				bg: "rgba(40, 45, 60, 0.6)",
+				border: "rgba(88, 104, 138, 0.4)",
+				rank: "rgba(255, 200, 100, 0.9)",
+			};
+			ctx.fillStyle = rowStyle.bg;
 			ctx.beginPath();
-			ctx.roundRect(popup.x + 20, itemY, popup.width - 40, rowHeight, 6);
+			ctx.roundRect(listRect.x, itemY, listRect.width, rowHeight, 6);
 			ctx.fill();
+			ctx.strokeStyle = rowStyle.border;
+			ctx.lineWidth = 1.2;
+			ctx.stroke();
 
 			ctx.textAlign = "left";
-			ctx.fillStyle = "rgba(255, 200, 100, 0.9)";
+			ctx.fillStyle = rowStyle.rank;
 			ctx.font = `${rankSize}px 'Helvetica Neue', Arial, sans-serif`;
-			ctx.fillText(`${i + 1}.`, popup.x + 35, itemY + rowHeight * 0.65);
+			ctx.fillText(`${i + 1}.`, listRect.x + 14, itemY + rowHeight * 0.65);
 
 			ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
 			ctx.font = `${rowTextSize}px 'Helvetica Neue', Arial, sans-serif`;
-			ctx.fillText(scoreData.name, popup.x + 60, itemY + rowHeight * 0.65);
+			ctx.fillText(scoreData.name, listRect.x + 40, itemY + rowHeight * 0.65);
 
 			ctx.textAlign = "right";
 			ctx.fillStyle = "rgba(150, 200, 255, 0.9)";
-			ctx.fillText(`Lv ${scoreData.level} • ${scoreData.score}`, popup.x + popup.width - 35, itemY + rowHeight * 0.65);
+			ctx.fillText(`Lv ${scoreData.level} • ${scoreData.score}`, listRect.x + listRect.width - 14, itemY + rowHeight * 0.65);
+		}
+		ctx.restore();
+
+		if (highScores.length === 0) {
+			ctx.textAlign = "center";
+			ctx.fillStyle = "rgba(190, 200, 220, 0.8)";
+			ctx.font = `${rowTextSize}px 'Helvetica Neue', Arial, sans-serif`;
+			ctx.fillText("Henüz skor yok", viewportWidth / 2, listRect.y + listRect.height * 0.5);
+		}
+
+		if (leaderboardMaxScroll > 0) {
+			const trackWidth = 4;
+			const trackX = listRect.x + listRect.width - trackWidth - 2;
+			const trackY = listRect.y + 4;
+			const trackHeight = listRect.height - 8;
+			const thumbHeight = Math.max(26, (listRect.height / totalHeight) * trackHeight);
+			const thumbTravel = Math.max(0, trackHeight - thumbHeight);
+			const thumbY = trackY + ((leaderboardScrollOffset / leaderboardMaxScroll) * thumbTravel);
+			ctx.fillStyle = "rgba(120, 145, 185, 0.28)";
+			ctx.fillRect(trackX, trackY, trackWidth, trackHeight);
+			ctx.fillStyle = "rgba(160, 200, 255, 0.8)";
+			ctx.fillRect(trackX, thumbY, trackWidth, thumbHeight);
 		}
 
 		const gradient = ctx.createLinearGradient(button.x, button.y, button.x, button.y + button.height);
@@ -2454,6 +2565,7 @@ const handleRestartPress = (event) => {
 	) {
 		isGameOver = false;
 		showScoreboard = true;
+		leaderboardScrollOffset = 0;
 		void loadHighScores(true);
 		return;
 	}
